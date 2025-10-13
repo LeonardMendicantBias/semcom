@@ -176,9 +176,9 @@ class AttentionMaskModeling(pl.LightningModule):
         acc = self.acc(student_output[:, 1:].flatten(0, 1).flatten(0, 1), code.flatten(0, 1).flatten(0, 1))
         masking_ratio = mask.sum(-1) / code.shape[-1]
 
-        self.log("train/loss", loss, on_step=True, prog_bar=True, logger=True)
-        self.log("train/acc", acc, on_step=True, prog_bar=True, logger=True)
-        self.log("train/mask_ratio", masking_ratio.mean().item(), on_step=True, prog_bar=True, logger=True)
+        self.log("train_loss", loss, on_step=True, prog_bar=True, logger=True)
+        self.log("train_acc", acc, on_step=True, prog_bar=True, logger=True)
+        self.log("train_mask_ratio", masking_ratio.mean().item(), on_step=True, prog_bar=True, logger=True)
 
         return loss
     
