@@ -122,12 +122,17 @@ class AttentionMaskModeling(pl.LightningModule):
         ).reshape((B, T, HW))
         return mask.to(torch.long)
 
+    def reset_cache(self):
+        self.teacher.reset_cache()
+        self.model.reset_cache()
+
     @torch.no_grad()
     def get_mask_from_logits(self,
         code: torch.FloatTensor,  # (B, HW, n_heads, T', T')
         K: int=None,
+        use_cache: bool=False
     ) -> torch.BoolTensor:
-        _, attn_logits = self.teacher(code, None)
+        _, attn_logits = self.teacher(code, None, use_cache)
         B, HW, _, T_, _ = attn_logits.shape
         
         # which tokens are salient according to the cls token

@@ -10,9 +10,11 @@ class MultiHeadAttention(nn.Module):
     def __init__(self,
         dim: int, heads: int,
         bias: bool=False, prob: float=0.1,
+        cache_size: int=-1,
     ) -> None:
         super().__init__()
         assert dim % heads == 0, "dim must be divisible by heads"
+        self.cache_size = cache_size
 
         self.dim = dim
         self.n_heads = heads
@@ -25,6 +27,43 @@ class MultiHeadAttention(nn.Module):
 
         self.proj = nn.Linear(dim, dim)
         self.proj_dropout = nn.Dropout(prob)
+
+        self.register_buffer("cache_k", None, persistent=False)
+        self.register_buffer("cache_v", None, persistent=False)
+
+    def reset_cache(self):
+        self.cache_k, self.cache_v = None, None
+
+    def _calculate_qkv(self,
+        query: torch.FloatTensor, memory: torch.FloatTensor,
+        use_cache: bool=False
+    ):
+        B, T, _ = query.shape
+        _, S, _ = memory.shape
+
+        q = self.query(query).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        k = self.key(memory).view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
+        v = self.value(memory).view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
+
+        # print("-"*30)
+        # print("kv", k.shape, v.shape)
+
+        if use_cache:
+            if self.cache_k is None:
+                self.cache_k, self.cache_v = k, v
+            else:
+                self.cache_k = torch.cat([self.cache_k, k], dim=2)
+                self.cache_v = torch.cat([self.cache_v, v], dim=2)
+
+            if self.cache_size != -1 and self.cache_k.shape[1] > self.cache_size:
+                self.cache_k = self.cache_k[:, -self.cache_size:]
+                self.cache_v = self.cache_v[:, -self.cache_size:]
+
+            k = self.cache_k
+            v = self.cache_v
+        # print("kv", k.shape, v.shape)
+
+        return q, k, v
     
     def _calculate_logits(self, 
         query: torch.FloatTensor,
@@ -48,13 +87,12 @@ class MultiHeadAttention(nn.Module):
     def forward(self,
         query: torch.FloatTensor, memory: torch.FloatTensor,
         mask: torch.BoolTensor,  # (B, T, S)
+        use_cache: bool=False
     ) -> torch.FloatTensor:
         B, T, _ = query.shape
         _, S, _ = memory.shape
         
-        q = self.query(query).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        k = self.key(memory).view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
-        v = self.value(memory).view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
+        q, k, v = self._calculate_qkv(query, memory, use_cache)
 
         logits = self._calculate_logits(q, k, mask)  # (B, H, T, S)
 

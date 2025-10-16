@@ -12,7 +12,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from torchvision.transforms import Compose, Resize, Normalize, ToTensor
 from torchvision.utils import make_grid, save_image
-from torchcodec.decoders import VideoDecoder
+# from torchcodec.decoders import VideoDecoder
 
 import pytorch_lightning as pl
 

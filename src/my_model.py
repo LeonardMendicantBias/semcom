@@ -44,13 +44,20 @@ class MaskCode(nn.Module):
                 height, width,
                 dim, 2*dim, heads,
                 activation=nn.Tanh,
-                drop_prob=drop_prob, depth_prob=depth_prob*i/depth
+                drop_prob=drop_prob, depth_prob=depth_prob*i/depth,
+                cache_size=length,
             ) for i in range(depth)
         ])
 
         self.norm = nn.LayerNorm(dim)
 
         self.code_head = nn.Linear(dim, n_codes)
+        self.current_pos = 0
+    
+    def reset_cache(self):
+        self.current_pos = 0
+        for block in self.transformer:
+            block.reset_cache()
 
     def create_temporal_mask(self,
         T: int,
@@ -63,6 +70,7 @@ class MaskCode(nn.Module):
     def forward(self,
         code: torch.LongTensor,        # (B, T, HW)
         token_mask: torch.LongTensor,   # (B, T, HW)
+        use_cache: bool=False
     ) -> Tuple[torch.FloatTensor, torch.FloatTensor]:
         B, T, HW = code.shape
 
@@ -87,10 +95,12 @@ class MaskCode(nn.Module):
         x = self.emb_norm(x)
 
         for layer in self.transformer:
-            x, attn = layer(x, None, temporal_mask)
+            x, attn = layer(x, None, temporal_mask, use_cache)
 
         logits = self.code_head(self.norm(x))
-
+        
+        if use_cache:
+            self.current_pos += 1
         return logits, attn
 
 
