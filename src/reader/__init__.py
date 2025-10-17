@@ -1,1 +1,1 @@
-from .kinetics import KineticDataset
+from .kinetics import KineticDataset, KineticDatasetVideo

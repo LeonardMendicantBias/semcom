@@ -14,10 +14,6 @@ from torchvision.transforms import Compose, Resize, Normalize, ToTensor
 from torchvision.utils import make_grid, save_image
 # from torchcodec.decoders import VideoDecoder
 
-import pytorch_lightning as pl
-
-from PIL import Image
-
 from src.vqgan import ViTVQGAN
 
 
@@ -137,6 +133,108 @@ class KineticDataset(Dataset):
 
         return token[rand_idx:rand_idx+self.n_frames], label
 
+
+class KineticDatasetVideo(Dataset):
+
+    def __init__(self,
+        path: str, split: str,
+        n_frames: int,
+        size: int=256, output_size: int=256,
+        mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5),
+        mini_size: int=32
+    ) -> None:
+        self.path = path
+        self.split = split
+        self.n_frames = n_frames
+        
+        self.size = size
+        self.output_size = output_size
+
+        self.transform = Compose([
+            Resize((size, size)),
+            # ToTensor(),
+            # Normalize(mean=mean, std=std)
+        ])
+
+        self.data = []
+        file_fmtstr = "{ytid}_{start:06}_{end:06}.mp4"
+        with open(f"{path}/annotations/{split}.csv", mode='r') as file:
+            reader = csv.DictReader(file)
+            for idx, row in enumerate(reader):
+                print(f"\r{idx}", end="")
+
+                f = file_fmtstr.format(
+                    ytid=row["youtube_id"],
+                    start=int(row["time_start"]),
+                    end=int(row["time_end"]),
+                )
+                label = row["label"].replace(" ", "_").replace("'", "").replace("(", "").replace(")", "")
+
+                h, w = self._get_video_dim(f"{path}/{split}/{f}")
+                if h is None or w is None: continue
+
+                self.data.append((f, label))
+                
+                if idx == 100:
+                    print()
+                    break
+    
+    @classmethod
+    def _get_video_dim(cls, video_path):
+        """get video (height, width) from video path"""
+        try:
+            probe = ffmpeg.probe(video_path)
+            video_stream = next((stream for stream in probe['streams']
+                                    if stream['codec_type'] == 'video'), None)
+            width = int(video_stream['width'])
+            height = int(video_stream['height'])
+            return height, width
+        except Exception as e:
+            print(e)
+            return None, None
+
+    def _get_resize_dim(self, raw_h, raw_w):
+        """returns a new (height, width) so that the shorter side is self.size"""
+        if isinstance(self.size, tuple) and len(self.size) == 2:
+            return self.size
+        elif raw_h >= raw_w:
+            return int(raw_h * self.size / raw_w), self.size
+        else:
+            return self.size, int(raw_w * self.size / raw_h)
+    
+    def __len__(self): return len(self.data)
+
+    def __getitem__(self, index: int) -> Tuple[np.ndarray, str]:
+        path, label = self.data[index]
+        h, w = self._get_video_dim(f"{self.path}/{self.split}/{path}")
+
+        resize_h, resize_w = self._get_resize_dim(h, w)
+        cmd = (
+            ffmpeg
+            .input(f"{self.path}/{self.split}/{path}")
+            .filter('scale', resize_w, resize_h)
+        )
+        output_height, output_width = resize_h, resize_w
+        out, _ = (
+            cmd.output('pipe:', format='rawvideo', pix_fmt='rgb24')
+            .run(capture_stdout=True, quiet=True)
+        )
+
+        frames = np.frombuffer(out, np.uint8).reshape([-1, output_height, output_width, 3])
+        frames = torch.from_numpy(frames.astype('float32'))
+        frames = frames.permute(0, 3, 1, 2)
+        frames = frames / 255.
+        frames = self.transform(frames)
+
+        rand_idx = random.randint(0, len(frames) - self.n_frames)
+        return frames[rand_idx:rand_idx+self.n_frames], label
+
+    @classmethod
+    def get_ds(cls, root, split, n_frames):
+        return KineticDatasetVideo(
+            root, split,
+            n_frames=n_frames,
+        )
 
 # class KineticDataModule(pl.LightningDataModule):
 

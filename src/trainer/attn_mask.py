@@ -34,16 +34,14 @@ class AttentionMaskModeling(pl.LightningModule):
         self.ema_warmup_steps = ema_warmup_steps
         self.top_p = top_p
 
-        self.save_hyperparameters(ignore=['model'])
-
         self.model = model
 
         self.teacher = copy.deepcopy(model)
         self._set_teacher_eval_and_freeze()
         
         self._step = 0 
-        
-        self.save_hyperparameters()
+
+        self.save_hyperparameters(ignore=['model'])
 
         self.acc = Accuracy(task="multiclass", num_classes=self.model.n_codes)
     
@@ -53,7 +51,7 @@ class AttentionMaskModeling(pl.LightningModule):
         # self.teacher.eval()
 
     def configure_optimizers(self):
-        optimizer = optim.Adam(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        optimizer = optim.Adam(self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
         warmup_scheduler = optim.lr_scheduler.LinearLR(
             optimizer,
             start_factor=1e-4, end_factor=1.0,
@@ -95,44 +93,18 @@ class AttentionMaskModeling(pl.LightningModule):
         for t_buf, s_buf in zip(self.teacher.buffers(), self.model.buffers()):
             t_buf.data.copy_(s_buf.data)
 
-    @torch.no_grad()
-    def get_mask(self,
-        code: torch.FloatTensor
-    ) -> torch.LongTensor:
-        B, T, HW = code.shape
-        _, attn_logits = self.teacher(code, None)
-
-        # which tokens are salient according to the cls token
-        cls_logits = attn_logits[:, :, :, 0, 1:]                    # (B, HW, n_heads, T)
-        cls_logits = cls_logits.permute(0, 2, 3, 1).flatten(-2, -1) # (B, n_heads, T*HW)
-        # average over all heads
-        attn = cls_logits.softmax(-1).mean(1)
-        
-        sorted_logits, sorted_indices = torch.sort(attn, descending=True)
-        cumulative_probs = torch.cumsum(sorted_logits, dim=-1)
-
-        prob = cumulative_probs > self.top_p
-        prob[..., 1:] = prob[..., :-1].clone()
-        prob[..., 0] = False
-        
-        mask = ~prob.scatter(
-            dim=-1,
-            index=sorted_indices,
-            src=prob
-        ).reshape((B, T, HW))
-        return mask.to(torch.long)
-
     def reset_cache(self):
         self.teacher.reset_cache()
         self.model.reset_cache()
 
     @torch.no_grad()
     def get_mask_from_logits(self,
-        code: torch.FloatTensor,  # (B, HW, n_heads, T', T')
+        # code: torch.FloatTensor,
+        frames: torch.FloatTensor,  # (B, T, 3, _, _)
         K: int=None,
         use_cache: bool=False
     ) -> torch.BoolTensor:
-        _, attn_logits = self.teacher(code, None, use_cache)
+        _, _, attn_logits = self.teacher.encoder(frames, None, use_cache)
         B, HW, _, T_, _ = attn_logits.shape
         
         # which tokens are salient according to the cls token
@@ -162,23 +134,23 @@ class AttentionMaskModeling(pl.LightningModule):
         """
             single frame prediction
         """
-        code, _ = batch  # (B, T, HW)
+        frames, _ = batch  # (B, T, HW)
 
         # generate masks for all time steps
         # with torch.no_grad():
         #     # (B, T, HW, C), (B, T, HW)
         #     _, attn_logits = self.teacher(code, None)
-        mask = self.get_mask_from_logits(code)  # (B, T', HW)
+        mask = self.get_mask_from_logits(frames)  # (B, T', HW)
         
-        student_output, _ = self.model(code, mask)
+        code, logits, _, dec = self.model(frames, mask)
 
         # only train the last time step
         loss = F.cross_entropy(
-            student_output[:, 1:].flatten(1, 2).flatten(0, 1),
+            logits[:, 1:].flatten(1, 2).flatten(0, 1),
             code.flatten(1, 2).flatten(0, 1),
             label_smoothing=0.01
         )
-        acc = self.acc(student_output[:, 1:].flatten(0, 1).flatten(0, 1), code.flatten(0, 1).flatten(0, 1))
+        acc = self.acc(logits[:, 1:].flatten(0, 1).flatten(0, 1), code.flatten(0, 1).flatten(0, 1))
         masking_ratio = mask.sum(-1) / code.shape[-1]
 
         self.log("train_loss", loss, on_step=True, prog_bar=True, logger=True)
