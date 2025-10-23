@@ -12,13 +12,4 @@ class RoPE(nn.Module):
         drop_prob: float=0.1,
     ):
         super().__init__()
-
-
-class RoPE2D(RoPE):
-
-    def __init__(self,
-        height: int, width: int,
-        dim: int,
-        drop_prob: float=0.1,
-    ):
-        super().__init__()
+        

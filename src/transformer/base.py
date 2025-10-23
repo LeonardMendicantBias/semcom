@@ -52,6 +52,9 @@ class Block(nn.Module):
         )
         self.drop_path = StochasticDepth(depth_prob, mode="row")
 
+    def reset_cache(self):
+        self.attn.reset_cache()
+
     def forward(self,
         query: torch.FloatTensor,
         memory: torch.FloatTensor,

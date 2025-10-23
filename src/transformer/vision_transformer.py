@@ -153,6 +153,10 @@ class VisionDecoder(nn.Module):
 
         # self.apply(utils.init_weights)
 
+    def reset_cache(self):
+        for block in self.transformer:
+            block.reset_cache()
+
     def forward(self,
         token: torch.FloatTensor,
         mask: torch.BoolTensor,

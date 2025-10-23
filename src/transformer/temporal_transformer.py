@@ -6,7 +6,7 @@ import torch.nn.functional as F
 
 from torchvision.ops import MLP, StochasticDepth
 
-from .attention import MultiHeadAttention
+from .attention import MultiHeadAttention, RoPEAttention
 from .base import Block
 from .vision_transformer import get_1d_sincos_pos_embed_from_grid,\
 	get_2d_sincos_pos_embed, get_2d_sincos_pos_embed_from_grid
@@ -28,10 +28,10 @@ class TemporalBlock(nn.Module):
 		self.dim, self.n_heads = dim, n_heads
 
 		self.spatial_attn_norm = nn.LayerNorm(dim)
-		self.spatial_attn: MultiHeadAttention = MultiHeadAttention(dim, n_heads, cache_size)
+		self.spatial_attn = MultiHeadAttention(dim, n_heads, cache_size)
 
 		self.temporal_attn_norm = nn.LayerNorm(dim)
-		self.temporal_attn: MultiHeadAttention = MultiHeadAttention(dim, n_heads, cache_size)
+		self.temporal_attn = RoPEAttention(dim, n_heads, cache_size)
 
 		self.mlp_norm = nn.LayerNorm(dim)
 		self.mlp: nn.Module = MLP(
@@ -87,33 +87,25 @@ class TemporalBlock(nn.Module):
 		
 		# reshaping for MHA
 		visual_x = visual_x.flatten(1, 2).flatten(0, 1).unsqueeze(-2)	# (B', 1, D)
-		neighbor_x = neighbor_x.reshape(B*T*HW, size, D)	# (B', 9, D)
-		# append a global CLS token to each neighbor
-		neighbor_x = torch.cat([
-			query[:, 0].mean(1, keepdim=True).repeat((T*HW, 1, 1)),  # (B', 1, D) -> (B*T*HW, 1, D)
-			neighbor_x,
-		], dim=1)  # (B', 1, D)
+		neighbor_x = neighbor_x.reshape(B*T*HW, size, D)		# (B', 9, D)
 
 		visual_x_norm = self.spatial_attn_norm(visual_x)		# (BTHW, 1, D)
-		neighbor_x_norm = self.spatial_attn_norm(neighbor_x)	# (BTHW, 9+1, D)
+		neighbor_x_norm = self.spatial_attn_norm(neighbor_x)	# (BTHW, 9, D)
 
 		# mask the padding spatial location
 		spatial_mask = torch.ones(
 			(B*T, 1, self.height, self.width),
-			dtype=torch.bool, device=query.device
+			dtype=torch.float, device=query.device
 		)
-		spatial_mask = ~F.unfold(
+		spatial_mask = 1 - F.unfold(
 			spatial_mask, self.window_size,
 			padding=padding_size, stride=1,
 		)  # (1, size*1, HW)
 		spatial_mask = spatial_mask.reshape(B*T, size, 1, HW).permute(0, 3, 2, 1)
-		spatial_mask = spatial_mask.flatten(1, 2).reshape(B*T*HW, 1, size)
-		# # mask for the global CLS token
-		spatial_mask = torch.cat([
-			spatial_mask, torch.zeros((B*T*HW, 1, 1), dtype=torch.bool, device=query.device)
-		], dim=-1)
+		spatial_mask = spatial_mask.flatten(1, 2).reshape(B*T*HW, 1, size).unsqueeze(1)
+		# print("spatial_mask", spatial_mask.shape)
 
-		# (B', 1, D), (B', 9+1, D)
+		# (B', 2, D), (B', 9, D)
 		x, attn_logits = self.spatial_attn(
 			visual_x_norm, neighbor_x_norm,
 			mask=spatial_mask, use_cache=use_cache
@@ -121,9 +113,8 @@ class TemporalBlock(nn.Module):
 		x = self.drop_path(x) + visual_x.reshape(B*T*HW, 1, D)
 		x = x.reshape(B, T, HW, D)
 
-		# add back CLS token
+		# add back the CLS token
 		x = torch.cat([query[:, 0:1], x], dim=1)
-		# attn = attn.reshape(B, T, HW, 12, 1, 10)
 
 		return x, attn_logits
 	
@@ -141,14 +132,15 @@ class TemporalBlock(nn.Module):
 
 		x = query.permute(0, 2, 1, 3).flatten(0, 1)  # (BHW, T', D)
 		x_norm = self.temporal_attn_norm(x)
+		
 		x_, attn_logits = self.temporal_attn(x_norm, x_norm, mask, use_cache=use_cache)
 		x = self.drop_path(x_) + x
 
 		x = x.reshape(B, HW, T_, D).permute(0, 2, 1, 3)
 		avg_cls = x[:, 0:1, :].mean(dim=2)
 		x[:, 0, :] = avg_cls
-
-		attn_logits = attn_logits.reshape(B, HW, self.n_heads, T_, T_)
+		
+		attn_logits = attn_logits.reshape(B, HW, self.n_heads, *attn_logits.shape[-2:])
 
 		return x, attn_logits
 
@@ -159,30 +151,9 @@ class TemporalBlock(nn.Module):
 		use_cache: bool=False
 	) -> torch.FloatTensor:
 		B, T_, HW, D = query.shape
-		
-		"""
-			Treating each frame independently, thus
-			query: (B*T*HW, 1, D) 
-			key: (B*T*HW, 10, D) 
 
-			KV caching, the KV of previous time step are already computed, thus
-			query: (B*HW, 1, D);	T=1 
-			key: (B*HW, 10, D); 	T=1
-		"""
 		x, spatial_attn_logits = self.extract_spatial_feature(query, spatial_mask, use_cache=False)
-		
-		if use_cache:
-			if self.cache_spatial is None:
-				self.cache_spatial = x
-			else:
-				self.cache_spatial = torch.cat([self.cache_spatial, x], dim=0)
-			
-			if self.cache_spatial.shape[1] > self.cache_size:
-				self.cache_spatial = self.cache_spatial[-self.cache_size:]
 
-		"""
-			Treating 
-		"""
 		x, temporal_attn_logits = self.extract_temporal_feature(x, temporal_mask, use_cache)
 
 		# non-linear
@@ -190,3 +161,42 @@ class TemporalBlock(nn.Module):
 		x = self.drop_path(self.mlp(x_norm)) + x
 
 		return x, temporal_attn_logits
+
+
+class TemporalTransformer(nn.Module):
+
+	def __init__(self,	  
+		window_size: Union[int, Tuple[int, int]],
+		length: int, height: int, width: int,
+		n_codes: int, depth: int,
+		dim: int, mlp_dim: int, n_heads: int,
+		activation: nn.Module,
+		drop_prob: float=0.1, depth_prob: float=0,
+	):
+		super().__init__()
+		self.window_size = window_size
+		self.height, self.width = height, width
+		self.depth = depth
+		self.dim, self.n_heads = dim, n_heads
+		
+		# Temporal Transformer
+		self.embedding = nn.Embedding(n_codes, dim)
+		self.cls_token = nn.Parameter(torch.empty(1, 1, 1, dim).normal_(std=0.02))
+		self.mask_token = nn.Parameter(torch.empty(1, 1, 1, dim).normal_(std=0.02))
+
+		self.h_emb = nn.Parameter(torch.empty(1, 1, height, dim).normal_(std=0.02))
+		self.w_emb = nn.Parameter(torch.empty(1, 1, width, dim).normal_(std=0.02))
+		self.emb_norm = nn.LayerNorm(dim)
+	
+		self.transformer = nn.ModuleList([
+			Block(
+				dim, 2*dim, n_heads, activation=nn.Tanh,
+				drop_prob=drop_prob, depth_prob=depth_prob*i/depth
+			) for i in range(depth)
+		])
+		self.norm = nn.LayerNorm(dim)
+
+	def forward(self,
+		codes: torch.LongTensor, # (B, T, HW)
+	) -> torch.FloatTensor:
+		pass
