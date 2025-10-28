@@ -15,7 +15,7 @@ import pytorch_lightning as pl
 class AttentionMaskModeling(pl.LightningModule):
 
 	def __init__(self,
-		model: nn.Module,  # MaskVideo
+		model: nn.Module,
 		top_p: float=0.95,
 		lr: float=1e-4,
 		T_max: int=5,
@@ -48,7 +48,7 @@ class AttentionMaskModeling(pl.LightningModule):
 	def _set_teacher_eval_and_freeze(self) -> None:
 		for p in self.teacher.parameters():
 			p.requires_grad = False
-		self.teacher.eval()
+		# self.teacher.eval()
 
 	def configure_optimizers(self):
 		optimizer = optim.Adam(self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
@@ -97,6 +97,38 @@ class AttentionMaskModeling(pl.LightningModule):
 		self.teacher.reset_cache()
 		self.model.reset_cache()
 
+	@torch.no_grad()
+	def get_mask_from_logits(self,
+		# code: torch.FloatTensor,
+		frames: torch.FloatTensor,  # (B, T, 3, _, _)
+		K: int=None,
+	) -> torch.BoolTensor:
+		_, _, attn_logits = self.teacher.encoder(frames, None, use_cache=False)
+		B, HW, _, T_, _ = attn_logits.shape
+		
+		# which tokens are salient according to the cls token
+		cls_logits = attn_logits[:, :, :, 0, 1:]  # (B, HW, n_heads, T)
+		cls_logits = cls_logits.permute(0, 2, 3, 1).flatten(-2, -1)  # (B, n_heads, T*HW)
+		# average over all heads
+		attn = cls_logits.softmax(-1).mean(1)
+		# if self.training:
+		#     attn = F.dropout(attn, 0.1)
+		
+		# stat for top-p
+		sorted_logits, sorted_indices = torch.sort(attn, descending=True)
+		cumulative_probs = torch.cumsum(sorted_logits, dim=-1)
+
+		prob = cumulative_probs > self.top_p
+		prob[..., 1:] = prob[..., :-1].clone()
+		prob[..., 0] = False
+		
+		mask = ~prob.scatter(
+			dim=-1,
+			index=sorted_indices,
+			src=prob
+		).reshape((B, T_-1, HW))
+		return mask.to(torch.long)
+
 	def training_step(self, batch, batch_idx):
 		"""
 			single frame prediction
@@ -107,18 +139,18 @@ class AttentionMaskModeling(pl.LightningModule):
 		# with torch.no_grad():
 		#     # (B, T, HW, C), (B, T, HW)
 		#     _, attn_logits = self.teacher(code, None)
-		mask = self.teacher.get_mask_from_frames(frames, self.top_p)  # (B, T, HW)
+		mask = self.get_mask_from_logits(frames)  # (B, T', HW)
 		
-		code, _, _, dec = self.model(frames, mask)
+		code, logits, _, dec = self.model(frames, mask)
 
 		# only train the last time step
 		loss = F.cross_entropy(
-			dec[:, 1:].flatten(1, 2).flatten(0, 1),
+			logits[:, 1:].flatten(1, 2).flatten(0, 1),
 			code.flatten(1, 2).flatten(0, 1),
 			label_smoothing=0.01
 		)
-		acc = self.acc(dec[:, 1:].flatten(0, 1).flatten(0, 1), code.flatten(0, 1).flatten(0, 1))
-		masking_ratio = 1 - mask.sum(-1) / mask.shape[-1]
+		acc = self.acc(logits[:, 1:].flatten(0, 1).flatten(0, 1), code.flatten(0, 1).flatten(0, 1))
+		masking_ratio = mask.sum(-1) / code.shape[-1]
 
 		self.log("train_loss", loss, on_step=True, prog_bar=True, logger=True)
 		self.log("train_acc", acc, on_step=True, prog_bar=True, logger=True)

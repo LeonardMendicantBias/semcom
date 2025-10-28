@@ -18,6 +18,9 @@ class MultiHeadAttention(nn.Module):
 
         self.dim = dim
         self.n_heads = heads
+        self.bias = bias
+        self.prob = prob
+
         self.head_dim = dim // heads
 
         self.query = nn.Linear(dim, dim, bias=bias)
@@ -30,6 +33,18 @@ class MultiHeadAttention(nn.Module):
 
         self.register_buffer("cache_k", None, persistent=False)
         self.register_buffer("cache_v", None, persistent=False)
+
+    # def build_query(self) -> nn.Module:
+    #     return nn.Linear(self.dim, self.dim, bias=self.bias)
+    
+    # def build_key(self) -> nn.Module:
+    #     return nn.Linear(self.dim, self.dim, bias=self.bias)
+    
+    # def build_value(self) -> nn.Module:
+    #     return nn.Linear(self.dim, self.dim, bias=self.bias)
+    
+    # def build_proj(self) -> nn.Module:
+    #     return nn.Linear(self.dim, self.dim)
 
     def reset_cache(self):
         self.cache_k, self.cache_v = None, None
@@ -49,8 +64,8 @@ class MultiHeadAttention(nn.Module):
             if self.cache_k is None:
                 self.cache_k, self.cache_v = k, v
             else:
-                self.cache_k = torch.cat([self.cache_k, k[:, :, -1:, :]], dim=2)
-                self.cache_v = torch.cat([self.cache_v, v[:, :, -1:, :]], dim=2)
+                self.cache_k = torch.cat([self.cache_k.detach(), k[:, :, -1:, :]], dim=2)
+                self.cache_v = torch.cat([self.cache_v.detach(), v[:, :, -1:, :]], dim=2)
 
             if self.cache_size != -1 and self.cache_k.shape[1] > self.cache_size:
                 self.cache_k = self.cache_k[:, -self.cache_size:]
