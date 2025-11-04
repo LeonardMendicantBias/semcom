@@ -62,13 +62,13 @@ class Block(nn.Module):
     ) -> torch.FloatTensor:
         x_norm = self.attn_norm(query)
         mem_norm = self.attn_norm(memory)
-        x, attn_logits = self.attn(x_norm, mem_norm, mask)
+        x, attn_logits, k, v = self.attn(x_norm, mem_norm, mask)
         x = self.drop_path(x) + query
 
         x_norm = self.mlp_norm(x)
         x = self.drop_path(self.mlp(x_norm)) + x
         
-        return x, attn_logits
+        return x, attn_logits, k, v
     
 
 class Transformer(nn.Module):

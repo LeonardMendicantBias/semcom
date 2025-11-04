@@ -107,7 +107,7 @@ class VisionTransformer(nn.Module):
         x = x + self.en_pos_embedding
 
         for module in self.transformer:
-            x, attn = module(x, x, mask)
+            x, attn, _, _ = module(x, x, mask)
         return self.norm(x)
 
 

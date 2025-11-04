@@ -1,4 +1,4 @@
-from typing import Union, Tuple
+from typing import Union, Tuple, List
 
 import torch
 from torch import nn
@@ -23,37 +23,7 @@ class Encoder(nn.Module):
 		self.pre_quant = pre_quant
 		self.quantizer = quantizer
 		self.transformer = temporal_transformer
-	
-	@torch.no_grad()
-	def get_mask_from_logits(self,
-		logits: torch.FloatTensor,  # (B, T, 3, _, _)
-		K: int=None,
-	) -> torch.BoolTensor:
-		B, HW, _, T_, _ = logits.shape
-		
-		# which tokens are salient according to the cls token
-		cls_logits = logits[:, :, :, 0, 1:]  # (B, HW, n_heads, T)
-		cls_logits = cls_logits.permute(0, 2, 3, 1).flatten(-2, -1)  # (B, n_heads, T*HW)
-		# average over all heads
-		attn = cls_logits.softmax(-1).mean(1)
-		# if self.training:
-		#     attn = F.dropout(attn, 0.1)
-		
-		# stat for top-p
-		sorted_logits, sorted_indices = torch.sort(attn, descending=True)
-		cumulative_probs = torch.cumsum(sorted_logits, dim=-1)
 
-		prob = cumulative_probs > self.top_p
-		prob[..., 1:] = prob[..., :-1].clone()
-		prob[..., 0] = False
-		
-		mask = ~prob.scatter(
-			dim=-1,
-			index=sorted_indices,
-			src=prob
-		).reshape((B, T_-1, HW))
-		return mask.to(torch.long)
-	
 	def process_frames(self, frames: torch.FloatTensor) -> torch.LongTensor:
 		B, T = frames.shape[:2]  # T = 1 during inference
 
@@ -66,12 +36,42 @@ class Encoder(nn.Module):
 	
 	def forward(self,
 		frames: torch.FloatTensor,  # (B, T, 3, H', W'), T should be 1
+		ks: List[torch.FloatTensor]=None, vs: List[torch.FloatTensor]=None,
 	) -> Tuple[torch.LongTensor, torch.BoolTensor]:
 		codes = self.process_frames(frames)
 
-		_, attn_logits = self.transformer(codes, None, use_cache=True)
-
-		return codes[:, -1], self.get_mask_from_codes(attn_logits)[:, -1]
+		x, attn_logits, ks, vs = self.transformer(codes, None, past_keys=ks, past_values=vs)
+		mask = self.transformer.get_mask_from_logits(attn_logits)
+		return codes[:, -1], mask[:, -1], ks, vs
+	
+	def export(self) -> None :
+		encoder = Encoder(
+			self.vit, self.pre_quant, self.quantizer,
+			self.transformer
+		).eval().cuda()
+		L = self.transformer.depth
+		HW = self.transformer.height * self.transformer.width
+		n_heads = self.transformer.n_heads
+		dummy_frames = torch.randn(1, 1, 3, 256, 256).cuda()
+		dummy_ks = torch.randn(L, HW, n_heads, 1, 16).cuda()
+		dummy_vs = torch.randn(L, HW, n_heads, 1, 16).cuda()
+		torch.onnx.export(
+			encoder,     #torch model
+			(dummy_frames, dummy_ks, dummy_vs),  #inputs
+			"encoder.onnx",   #path of the output onnx model
+			input_names=["frames", "prev_k", "prev_v"],
+			output_names=["code", "mask", "curr_k", "curr_v"],
+			dynamic_axes={
+				# 'frames': {1: 'sequence'}, temporal length of frames is always ONE: the current frame
+				'prev_k': {3: 'sequence'},
+				'prev_v': {3: 'sequence'},
+				'curr_k': {3: 'sequence'},
+				'curr_v': {3: 'sequence'},
+			},
+			export_params=True,
+			opset_version=14
+		)
+		print("ONNX model saved: encoder.onnx")
 
 
 class Decoder(nn.Module):
@@ -109,6 +109,7 @@ class MaskVideo(nn.Module):
 		temporal_depth: int, temporal_heads: int, temporal_dim: int,
 		
 		drop_prob:float=0.1, depth_prob: float=0.1,
+		vitvq_path: str=None,
 	):
 		super().__init__()
 		self.is_finetune = is_finetune
@@ -134,6 +135,8 @@ class MaskVideo(nn.Module):
 
 		self.code_head = nn.Linear(temporal_dim, n_codes)
 
+		if vitvq_path is not None: self.init_vit_from_ckpt(vitvq_path)
+
 		if not is_finetune:
 			for param in self.vit.parameters():
 				param.requires_grad = False
@@ -143,22 +146,79 @@ class MaskVideo(nn.Module):
 				param.requires_grad = False
 		else: pass  # implement LoRA
 
-	def export_encoder(self) -> None:
-		encoder = Encoder()
-		dummy_input = torch.randn(1, 1, 3, 256, 256)
-		torch.onnx.export(encoder, (dummy_input, None, True), "encoder.onnx", export_params=True)
-		print("ONNX model saved: encoder.onnx")
+	@torch.no_grad()
+	def init_vit_from_ckpt(self, path: str):
+		sd = torch.load(path)["state_dict"]
+		for key, item in sd.items():
+			if key.startswith("quantizer"):
+				self.quantizer.embedding.weight.data.copy_(item)
+			elif key.startswith("pre_quant"):
+				if "weight" in key:
+					self.pre_quant.weight.data.copy_(item)
+				elif "bias" in key:
+					self.pre_quant.bias.data.copy_(item)
+			elif key.startswith("encoder"):
+				# Encoder
+				if "transformer" in key:
+					if "layers" in key:
+						layer_idx = key.index("layers")
+						dot_idx = key.find(".", layer_idx+len("layers")+1)
+						idx = int(key[layer_idx+len("layers")+1:dot_idx])
+						if "0" in key[dot_idx:]:
+							if "norm" in key[dot_idx:]:
+								if "weight" in key[dot_idx:]:
+									self.vit.transformer[idx].attn_norm.weight.data.copy_(item)
+								if "bias" in key[dot_idx:]:
+									self.vit.transformer[idx].attn_norm.bias.data.copy_(item)
+							if "fn" in key[dot_idx:]:
+								if "to_qkv" in key[dot_idx:]:
+									if "weight" in key[dot_idx:]:
+										d = item.shape[1]
+										self.vit.transformer[idx].attn.query.weight.copy_(item[:d])
+										self.vit.transformer[idx].attn.key.weight.copy_(item[d:-d])
+										self.vit.transformer[idx].attn.value.weight.copy_(item[-d:])
+									if "bias" in key[dot_idx:]: pass
+								if "to_out" in key[dot_idx:]:
+									if "weight" in key[dot_idx:]:
+										self.vit.transformer[idx].attn.proj.weight.data.copy_(item)
+									if "bias" in key[dot_idx:]:
+										self.vit.transformer[idx].attn.proj.bias.data.copy_(item)
+						if "1" in key[dot_idx:]:
+							if "norm" in key[dot_idx:]:
+								if "weight" in key[dot_idx:]:
+									self.vit.transformer[idx].mlp_norm.weight.copy_(item)
+								if "bias" in key[dot_idx:]:
+									self.vit.transformer[idx].mlp_norm.bias.copy_(item)
+							if "net" in key[dot_idx:]:
+								if ".net.0." in key[dot_idx:]:
+									if "weight" in key[dot_idx:]:
+										self.vit.transformer[idx].mlp[0].weight.copy_(item)
+									if "bias" in key[dot_idx:]:
+										self.vit.transformer[idx].mlp[0].bias.copy_(item)
+								if ".net.2." in key[dot_idx:]:
+									if "weight" in key[dot_idx:]:
+										self.vit.transformer[idx].mlp[3].weight.copy_(item)
+									if "bias" in key[dot_idx:]:
+										self.vit.transformer[idx].mlp[3].bias.copy_(item)
+					elif "encoder.transformer.norm" in key:
+						if "weight" in key:
+							self.vit.norm.weight.data.copy_(item)
+						if "bias" in key:
+							self.vit.norm.bias.data.copy_(item)
+				elif "en_pos_embedding" in key:
+					self.vit.en_pos_embedding.copy_(item)
+				elif "to_patch_embedding" in key:
+					if "weight" in key:
+						self.vit.to_patch_embedding[0].weight.copy_(item)
+					elif "bias" in key:
+						self.vit.to_patch_embedding[0].bias.copy_(item)
 	
 	def export_decoder(self) -> None:
-		decoder = Decoder()
+		decoder = Decoder(self.transformer, self.code_head)
 		dummy_input = torch.randn(1, 16, 1024)
 		dummy_mask = torch.randn(1, 16, 1024)
 		torch.onnx.export(decoder, (dummy_input, dummy_mask, True), "decoder.onnx", export_params=True)
 		print("ONNX model saved: decoder.onnx")
-	
-	def reset_cache(self):
-		self.current_pos = 1
-		self.transformer.reset_cache()
 
 	def process_frames(self, frames: torch.FloatTensor) -> torch.LongTensor:
 		B, T = frames.shape[:2]  # T = 1 during inference
@@ -175,22 +235,23 @@ class MaskVideo(nn.Module):
 		frames: torch.FloatTensor,  # (B, T, 3, _, _)
 		top_p: float,
 		K: int=None,
-		use_cache: bool=False,
+		past_keys: torch.FloatTensor=None, past_values: torch.FloatTensor=None,
 	) -> torch.BoolTensor:
 		codes = self.process_frames(frames)
-		_, attn_logits = self.transformer(codes, None, use_cache)
+		_, attn_logits, _, _ = self.transformer(codes, None, past_keys, past_values)
 		return self.transformer.get_mask_from_logits(attn_logits)
 	
 	def forward(self,
-		frames: torch.FloatTensor,
+		frames: torch.FloatTensor,  # (B, T, 3, _, _)
 		token_mask: torch.LongTensor=None,
-		use_cache: bool=False
 	) -> Tuple[torch.BoolTensor, torch.LongTensor, torch.FloatTensor]:
-		codes = self.process_frames(frames)
+		codes = self.process_frames(frames)  # (B, T, HW)
 
-		x, attn_logits = self.transformer(codes, token_mask, use_cache)
+		# during training, no need for KV-caching
+		x, attn_logits, _, _ = self.transformer(codes, token_mask)
 
-		dec = self.code_head(x)
+		# ignore CLS token for decoding
+		dec = self.code_head(x[:, :-1])
 
 		return codes, x, attn_logits, dec
 	

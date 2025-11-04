@@ -6,3 +6,5 @@ wandb/
 semcom/
 trained/
 .vscode/
+*.trt
+*.onnx

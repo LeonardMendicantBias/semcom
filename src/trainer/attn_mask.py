@@ -98,26 +98,20 @@ class AttentionMaskModeling(pl.LightningModule):
 		self.model.reset_cache()
 
 	def training_step(self, batch, batch_idx):
-		"""
-			single frame prediction
-		"""
 		frames, _ = batch  # (B, T, HW)
 
 		# generate masks for all time steps
-		# with torch.no_grad():
-		#     # (B, T, HW, C), (B, T, HW)
-		#     _, attn_logits = self.teacher(code, None)
 		mask = self.teacher.get_mask_from_frames(frames, self.top_p)  # (B, T, HW)
 		
 		code, _, _, dec = self.model(frames, mask)
 
 		# only train the last time step
 		loss = F.cross_entropy(
-			dec[:, 1:].flatten(1, 2).flatten(0, 1),
+			dec.flatten(1, 2).flatten(0, 1),
 			code.flatten(1, 2).flatten(0, 1),
 			label_smoothing=0.01
 		)
-		acc = self.acc(dec[:, 1:].flatten(0, 1).flatten(0, 1), code.flatten(0, 1).flatten(0, 1))
+		acc = self.acc(dec.flatten(1, 2).flatten(0, 1), code.flatten(1, 2).flatten(0, 1))
 		masking_ratio = 1 - mask.sum(-1) / mask.shape[-1]
 
 		self.log("train_loss", loss, on_step=True, prog_bar=True, logger=True)

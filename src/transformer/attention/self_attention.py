@@ -31,9 +31,6 @@ class MultiHeadAttention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_dropout = nn.Dropout(prob)
 
-        self.register_buffer("cache_k", None, persistent=False)
-        self.register_buffer("cache_v", None, persistent=False)
-
     # def build_query(self) -> nn.Module:
     #     return nn.Linear(self.dim, self.dim, bias=self.bias)
     
@@ -51,7 +48,8 @@ class MultiHeadAttention(nn.Module):
 
     def _calculate_qkv(self,
         query: torch.FloatTensor, memory: torch.FloatTensor,
-        use_cache: bool=False
+        # use_cache: bool=False
+        past_key: torch.FloatTensor=None, past_value: torch.FloatTensor=None,
     ):
         B, T, _ = query.shape
         _, S, _ = memory.shape
@@ -60,19 +58,9 @@ class MultiHeadAttention(nn.Module):
         k = self.key(memory).view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
         v = self.value(memory).view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
         
-        if use_cache:
-            if self.cache_k is None:
-                self.cache_k, self.cache_v = k, v
-            else:
-                self.cache_k = torch.cat([self.cache_k.detach(), k[:, :, -1:, :]], dim=2)
-                self.cache_v = torch.cat([self.cache_v.detach(), v[:, :, -1:, :]], dim=2)
-
-            if self.cache_size != -1 and self.cache_k.shape[1] > self.cache_size:
-                self.cache_k = self.cache_k[:, -self.cache_size:]
-                self.cache_v = self.cache_v[:, -self.cache_size:]
-
-            k = self.cache_k
-            v = self.cache_v
+        if past_key is not None and past_value is not None:
+            k = torch.cat([past_key.detach(), k], dim=2)
+            v = torch.cat([past_value.detach(), v], dim=2)
 
         return q, k, v
     
@@ -90,6 +78,7 @@ class MultiHeadAttention(nn.Module):
             # unsqueeze for batch dimension (when mask is done per head)
             if mask.ndim == 3: mask = mask.unsqueeze(0)
             # mask = mask.unsqueeze(1).repeat(1, self.n_heads, 1, 1)
+            # print("logits", logits.shape, mask.shape)
             logits = logits.masked_fill(mask.to(torch.bool), -1e4)  # more stable than -torch.inf
 
         return logits
@@ -102,9 +91,10 @@ class MultiHeadAttention(nn.Module):
     def forward(self,
         query: torch.FloatTensor, memory: torch.FloatTensor,
         mask: torch.BoolTensor,  # (B, T, S)
-        use_cache: bool=False
+        # use_cache: bool=False
+        past_key: torch.FloatTensor=None, past_value: torch.FloatTensor=None,
     ) -> torch.FloatTensor:
-        q, k, v = self._calculate_qkv(query, memory, use_cache)
+        q, k, v = self._calculate_qkv(query, memory, past_key, past_value)
 
         logits = self._calculate_logits(q, k, mask)  # (B, H, T, S)
 
@@ -116,7 +106,7 @@ class MultiHeadAttention(nn.Module):
 
         out = self.proj(weighted)
 
-        return self.proj_dropout(out), logits
+        return self.proj_dropout(out), logits, k, v
 
 
 class RoPEAttention(MultiHeadAttention):
