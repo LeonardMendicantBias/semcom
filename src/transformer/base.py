@@ -61,8 +61,9 @@ class Block(nn.Module):
         mask: torch.BoolTensor
     ) -> torch.FloatTensor:
         x_norm = self.attn_norm(query)
-        mem_norm = self.attn_norm(memory)
-        x, attn_logits, k, v = self.attn(x_norm, mem_norm, mask)
+        if memory is None: memory = x_norm
+
+        x, attn_logits, k, v = self.attn(x_norm, memory, mask)
         x = self.drop_path(x) + query
 
         x_norm = self.mlp_norm(x)

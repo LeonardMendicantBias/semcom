@@ -231,7 +231,7 @@ class KineticDatasetVideo(Dataset):
 
     @classmethod
     def get_ds(cls, root, split, n_frames):
-        return KineticDatasetVideo(
+        return cls(
             root, split,
             n_frames=n_frames,
         )

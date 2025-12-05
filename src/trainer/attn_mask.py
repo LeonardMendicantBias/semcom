@@ -17,7 +17,7 @@ class AttentionMaskModeling(pl.LightningModule):
 	def __init__(self,
 		model: nn.Module,  # MaskVideo
 		top_p: float=0.95,
-		lr: float=1e-4,
+		lr: float=5e-4,
 		T_max: int=5,
 		warmup_epochs: int=5,
 		weight_decay: float=0.0,
@@ -93,32 +93,40 @@ class AttentionMaskModeling(pl.LightningModule):
 		for t_buf, s_buf in zip(self.teacher.buffers(), self.model.buffers()):
 			t_buf.data.copy_(s_buf.data)
 
-	def reset_cache(self):
-		self.teacher.reset_cache()
-		self.model.reset_cache()
-
 	def training_step(self, batch, batch_idx):
-		frames, _ = batch  # (B, T, HW)
+		# frames, _ = batch  # (B, T, HW)
+		frames = batch  # (B, T, HW)
 
-		# generate masks for all time steps
+		# # generate masks for all time steps
 		mask = self.teacher.get_mask_from_frames(frames, self.top_p)  # (B, T, HW)
 		
-		code, _, _, dec = self.model(frames, mask)
+		code, features, _, _, dec = self.model(frames, mask)
 
 		# only train the last time step
-		loss = F.cross_entropy(
-			dec.flatten(1, 2).flatten(0, 1),
+		code_loss = F.cross_entropy(
+			dec["code"].flatten(1, 2).flatten(0, 1),
 			code.flatten(1, 2).flatten(0, 1),
 			label_smoothing=0.01
 		)
-		acc = self.acc(dec.flatten(1, 2).flatten(0, 1), code.flatten(1, 2).flatten(0, 1))
-		masking_ratio = 1 - mask.sum(-1) / mask.shape[-1]
+		# print(dec["rgb"].shape, frames.shape)
+		# rgb_loss = F.mse_loss(dec["rgb"], frames)
+		rgb_loss = F.binary_cross_entropy_with_logits(dec["rgb"], frames)
+		feat_loss = F.mse_loss(dec["feat"], features)
+		acc = self.acc(dec["code"].flatten(1, 2).flatten(0, 1), code.flatten(1, 2).flatten(0, 1))
+		# masking_ratio = 1 - mask.sum(-1) / mask.shape[-1]
 
-		self.log("train_loss", loss, on_step=True, prog_bar=True, logger=True)
+		self.log("train_code_loss", code_loss, on_step=True, prog_bar=True, logger=True)
+		self.log("train_rgb_loss", rgb_loss, on_step=True, prog_bar=True, logger=True)
+		self.log("train_feat_loss", feat_loss, on_step=True, prog_bar=True, logger=True)
 		self.log("train_acc", acc, on_step=True, prog_bar=True, logger=True)
-		self.log("train_mask_ratio", masking_ratio.mean().item(), on_step=True, prog_bar=True, logger=True)
+		# self.log("train_mask_ratio", masking_ratio.mean().item(), on_step=True, prog_bar=True, logger=True)
 
-		return loss
+		# return {
+		# 	"code": code_loss,
+		# 	"feat": feat_loss,
+		# 	"rgb": rgb_loss
+		# }
+		return code_loss + feat_loss + 0.1*rgb_loss
 	
 	def on_train_batch_end(self, outputs, batch, batch_idx: int, dataloader_idx: int=0):
 		# increment and compute momentum (optional warmup)

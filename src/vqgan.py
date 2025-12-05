@@ -20,7 +20,7 @@ class ViTVQGAN(nn.Module):
         depth: int, heads: int,
         dim: int, embed_dim: int,
         n_codes: int, 
-        path: str=None
+        path: str=None # type: ignore
     ):
         super().__init__()
         self.path = path
