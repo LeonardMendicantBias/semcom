@@ -47,9 +47,10 @@ class MultiHeadAttention(nn.Module):
         self.cache_k, self.cache_v = None, None
 
     def _calculate_qkv(self,
-        query: torch.FloatTensor, memory: torch.FloatTensor,
-        # use_cache: bool=False
-        past_key: torch.FloatTensor=None, past_value: torch.FloatTensor=None,
+        query: torch.FloatTensor,
+        memory: torch.FloatTensor,
+        past_key: torch.FloatTensor=None,
+        past_value: torch.FloatTensor=None,
     ):
         B, T, _ = query.shape
         _, S, _ = memory.shape

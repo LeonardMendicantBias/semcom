@@ -20,6 +20,8 @@ class KittiVideoDataset(Dataset):
         size: Union[int, Tuple]=(384, 1248),
         mean=[0.485, 0.456, 0.406],
         std=[0.229, 0.224, 0.225],
+        # for debug
+        n_samples: int=-1
     ) -> None:
         self.root, self.split = root, split
         self.n_frames = n_frames
@@ -39,6 +41,9 @@ class KittiVideoDataset(Dataset):
                     f"{dirpath}/{filenames[idx+i]}"
                     for i in range(n_frames)
                 ])
+
+                if len(self.data) == n_samples: break
+            if len(self.data) == n_samples: break
         
     def __len__(self): return len(self.data)
 
@@ -55,9 +60,10 @@ class KittiVideoDataset(Dataset):
         return torch.stack(frames, dim=0)#.permute(0, 3, 1, 2)
 
     @classmethod
-    def get_ds(cls, root, split, n_frames, size):
+    def get_ds(cls, root, split, n_frames, size, n_samples=-1):
         return cls(
             root, split,
             n_frames=n_frames,
             size=size,
+            n_samples=n_samples,
         )

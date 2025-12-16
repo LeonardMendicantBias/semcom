@@ -163,7 +163,7 @@ class VisionDecoder(nn.Module):
     ) -> torch.FloatTensor:
         x = token + self.de_pos_embedding
         for module in self.transformer:
-            x, attn = module(x, x, mask)
+            x, attn, _, _ = module(x, x, mask)
         x = self.norm(x)
         x = self.to_pixel(x)
         return x

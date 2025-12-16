@@ -15,16 +15,32 @@ from .vqgan import ViTVQGAN
 class Encoder(nn.Module):
 	
 	def __init__(self,
+		image_size: Union[int, Tuple[int, int]],
+		patch_size: Union[int, Tuple[int, int]],
+		depth: int, heads: int, dim: int,
+		length: int,
 		vit: nn.Module,
 		pre_quant: nn.Linear,
 		quantizer: VectorQuantizer,
-		temporal_transformer: nn.Module
+		cls_token: nn.Parameter,
+		mask_token: nn.Parameter,
+		transformer: nn.Module,
+		transformer_norm: nn.LayerNorm
 	):
 		super().__init__()
+		self.image_size, self.patch_size = image_size, patch_size
+		self.depth, self.n_heads, self.dim = depth, heads, dim
+		self.length = length
+		self.head_dim = dim // heads
+
 		self.vit = vit
 		self.pre_quant = pre_quant
 		self.quantizer = quantizer
-		self.transformer = temporal_transformer
+
+		self.cls_token = cls_token
+		self.mask_token = mask_token
+		self.transformer = transformer
+		self.transformer_norm = transformer_norm
 
 	def process_frames(self, frames: torch.FloatTensor) -> torch.LongTensor:
 		B, T = frames.shape[:2]  # T = 1 during inference
@@ -34,17 +50,100 @@ class Encoder(nn.Module):
 		h = self.pre_quant(features)
 		_, _, codes = self.quantizer(h)
 		HW = codes.shape[-1]
-		return codes.reshape(B, T, HW)  # (B, T, HW)
+		# (B, T, HW)
+		return codes.reshape(B, T, HW), features.reshape(B, T, HW, -1)
+
+	def create_temporal_mask(self,
+		S: int, T: int,
+		device: torch.device=torch.device("cpu")
+	) -> torch.BoolTensor:
+		# ClS token from other tokens, but NOT vice versa, facilitating KV caching
+		mask = torch.triu(torch.ones(S+1, T+1, device=device), diagonal=1)
+		mask[:, 0] = True
+		mask[0, :] = False
+		return mask
+
+	@torch.no_grad()
+	def get_mask_from_logits(self,
+		# logits are extarcted from self-attention module
+		logits: torch.FloatTensor,  # (B, HW, heads, T_, T_)
+		# past_mask: torch.FloatTensor,
+		K: int=None,
+		top_p: float=0.9,
+	) -> torch.BoolTensor:
+		"""
+			mask patches with low attention scores
+
+		"""
+		# print("logits", logits.shape)
+		B, HW, _, S, T_ = logits.shape
+		
+		# which patches are salient according to the cls token
+		cls_logits = logits[:, :, :, 0, 1:]  # (B, HW, n_heads, T)
+
+		# first softmax over spatial dimension then temporal
+		# to ensure some patches are choosen at all time steps
+		cls_logits = cls_logits.permute(0, 2, 3, 1)  # (B, n_heads, T, HW)
+		cls_logits = cls_logits.softmax(dim=-1).flatten(-2, -1)  # (B, n_heads, T*HW)
+		# average over all heads -> (B, T*HW)
+		attn = cls_logits.softmax(-1).mean(1)
+		
+		if self.training:
+			attn = F.dropout(attn, 0.1)
+		# sorted_attn, sorted_indices = torch.sort(attn, descending=True, dim=1)
+		sorted_attn, sorted_indices = torch.topk(attn, attn.shape[-1], largest=True, sorted=True, dim=1)
+		cumulative_probs = torch.cumsum(sorted_attn, dim=1)
+
+		# top patches whose commulative attention scores are more than top_p are unmasked (set to False)
+		prob = cumulative_probs > top_p
+		prob[..., 1:] = prob[..., :-1].clone()
+		prob[..., 0] = False
+		
+		mask = prob.scatter(
+			dim=-1,
+			index=sorted_indices,  # while ordered, the indices are of original sequence
+			src=prob
+		).reshape((B, T_-1, HW))
+		
+		return mask.to(torch.long)
 	
 	def forward(self,
 		frames: torch.FloatTensor,  # (B, T, 3, H', W'), T should be 1
-		ks: List[torch.FloatTensor]=None, vs: List[torch.FloatTensor]=None,
+		# past_visual_infos: List[torch.FloatTensor]=None,
+		ks: List[torch.FloatTensor]=None,
+		vs: List[torch.FloatTensor]=None,
 	) -> Tuple[torch.LongTensor, torch.BoolTensor]:
-		codes = self.process_frames(frames)
+		codes, features = self.process_frames(frames)
+		
+		B, T, HW = features.shape[:3]
+		if ks is not None:
+			S = T + ks.shape[3]#-1
+		else:
+			S = T
+		
+		cls_token = self.cls_token.repeat((B, 1, HW, 1))
+		x = torch.cat([cls_token, features], dim=1)  # (B, T', HW, D)
 
-		x, attn_logits, ks, vs = self.transformer(codes, None, past_keys=ks, past_values=vs)
-		mask = self.transformer.get_mask_from_logits(attn_logits)
-		return codes[:, -1], mask[:, -1], ks, vs
+		temporal_mask = self.create_temporal_mask(T, S, codes.device)
+
+		# _ks, _vs = [], []
+		_T = ks.shape[-2] if ks is not None else 0
+		_ks = torch.empty((self.depth, HW, self.n_heads, 1, self.head_dim), requires_grad=False, device=codes.device)
+		_vs = torch.empty((self.depth, HW, self.n_heads, 1, self.head_dim), requires_grad=False, device=codes.device)
+		for i, block in enumerate(self.transformer):
+			# _visual_info = past_visual_infos[i] if past_visual_infos else None
+			_k = ks[i] if ks is not None else None
+			_v = vs[i] if vs is not None else None
+
+			x, attn_logits, k, v = block(
+				x, None, temporal_mask, _k, _v
+			)  # (B, n_heads, HW, D), (HW, n_heads, B, h_dim)
+			_ks[i].copy_(k[:, :, 1:2])
+			_vs[i].copy_(v[:, :, 1:2])
+		
+		# mask = self.get_mask_from_logits(attn_logits)
+		# return codes[:, -1], mask[:, -1], _visual_infos, _ks, _vs
+		return codes[:, -1], _ks, _vs
 	
 	def export(self) -> None :
 		encoder = Encoder(
@@ -81,10 +180,12 @@ class Decoder(nn.Module):
 	def __init__(self,
 		temporal_transformer: nn.Module,
 		decoder: nn.Module,
+		post_quant: nn.Module,
 	):
 		super().__init__()
 		self.transformer = temporal_transformer
 		self.decoder = decoder
+		self.post_quant = post_quant
 
 	def forward(self,
 		code: torch.LongTensor,  # (B, T, 3, H', W')
@@ -103,7 +204,7 @@ class MaskVideo(nn.Module):
 		is_finetune: bool,
 		image_size: Union[int, Tuple[int, int]],
 		patch_size: Union[int, Tuple[int, int]],
-		vit_depth: int, vit_heads: int, vit_dim: int,
+		vit_depth: int, vit_heads: int, dim: int,
 		n_codes: int, embed_dim: int,
 		# setting for transformer
 		window_size: Union[int, Tuple[int, int]],
@@ -117,42 +218,40 @@ class MaskVideo(nn.Module):
 		self.is_finetune = is_finetune
 		self.image_size, self.patch_size = image_size, patch_size
 		self.n_codes = n_codes
-		self.dim = vit_dim
+		self.dim = dim
 
 		self.vit = VisionTransformer(
 			image_size=image_size, patch_size=patch_size,
 			depth=vit_depth, heads=vit_heads,
-			dim=vit_dim, mlp_dim=4*vit_dim,
+			dim=dim, mlp_dim=4*dim,
 			drop_prob=drop_prob, depth_prob=depth_prob
 		)
-		self.pre_quant = nn.Linear(vit_dim, embed_dim)
+		self.pre_quant = nn.Linear(dim, embed_dim)
 		self.quantizer = VectorQuantizer(embed_dim, n_codes)
+		self.post_quant = nn.Linear(embed_dim, dim)
 
-		temporal_dim = vit_dim
-
-		self.cls_token = nn.Parameter(torch.empty(1, 1, 1, temporal_dim).normal_(std=0.02))
-		self.mask_token = nn.Parameter(torch.empty(1, 1, 1, temporal_dim).normal_(std=0.02))
+		self.cls_token = nn.Parameter(torch.empty(1, 1, 1, dim).normal_(std=0.02))
+		self.mask_token = nn.Parameter(torch.empty(1, 1, 1, dim).normal_(std=0.02))
 		self.transformer = nn.ModuleList([
 			TemporalBlock(
 				window_size, height, width,
-				temporal_dim, 4*temporal_dim, temporal_heads,
+				dim, 4*dim, temporal_heads,
 				activation=nn.Tanh,
 				drop_prob=drop_prob, depth_prob=depth_prob*i/temporal_depth,
 				cache_size=length,
 			) for i in range(temporal_depth)
 		])
-		self.transformer_norm = nn.LayerNorm(temporal_dim)
+		self.transformer_norm = nn.LayerNorm(dim)
 
-		self.code_head = nn.Linear(temporal_dim, n_codes)
-		self.rgb_head = nn.Linear(temporal_dim, 3)
-		self.feat_head = nn.Linear(temporal_dim, temporal_dim)
+		self.code_head = nn.Linear(dim, n_codes)
+		self.feat_head = nn.Linear(dim, dim)
 		self.rgb_head = nn.Sequential(
 			Rearrange(
 				"b (h w) c -> b c h w",
 				h=image_size[0]//patch_size[0], w=image_size[1]//patch_size[1]
 			),
 			nn.ConvTranspose2d(
-				vit_dim, 3, kernel_size=patch_size, stride=patch_size
+				dim, 3, kernel_size=patch_size, stride=patch_size
 			),
 		)
 
@@ -178,6 +277,11 @@ class MaskVideo(nn.Module):
 					self.pre_quant.weight.data.copy_(item)
 				elif "bias" in key:
 					self.pre_quant.bias.data.copy_(item)
+			elif key.startswith("post_quant"):
+				if "weight" in key:
+					self.post_quant.weight.data.copy_(item)
+				elif "bias" in key:
+					self.post_quant.bias.data.copy_(item)
 			elif key.startswith("encoder"):
 				# Encoder
 				if "transformer" in key:
@@ -249,7 +353,8 @@ class MaskVideo(nn.Module):
 		h = self.pre_quant(features)
 		_, _, codes = self.quantizer(h)
 		HW = codes.shape[-1]
-		return codes.reshape(B, T, HW), features.reshape(B, T, HW, -1)  # (B, T, HW)
+		# (B, T, HW)
+		return codes.reshape(B, T, HW), features.reshape(B, T, HW, -1)
 
 	@torch.no_grad()
 	def get_mask_from_logits(self,
@@ -325,6 +430,32 @@ class MaskVideo(nn.Module):
 		mask[0, :] = False
 		return mask
 	
+	def _decode(self, x: torch.FloatTensor):
+		B, T = x.shape[:2]
+
+		# decode code
+		dec_code_logit = self.code_head(x)
+		dec_code = dec_code_logit.argmax(-1).detach()
+
+		# decode features
+		quant = self.quantizer.embedding(dec_code)
+		quant = self.quantizer.norm(quant)
+		if self.quantizer.use_residual:
+			quant = quant.sum(-2)
+		quant = self.post_quant(quant)
+		dec_feat = self.feat_head(x) + quant
+		
+		# decode RGB
+		dec_rgb = self.rgb_head(x.flatten(0, 1))
+		dec_rgb = dec_rgb.reshape(B, T, *dec_rgb.shape[-3:])
+
+		return {
+			"rgb": dec_rgb,
+			"code_logit": dec_code_logit,
+			"code": dec_code,
+			"feat": dec_feat,
+		}
+
 	def forward(self,
 		frames: torch.FloatTensor,  # (B, T, 3, _, _)
 		token_mask: torch.BoolTensor=None,  # True = keep, False = mask
@@ -349,17 +480,5 @@ class MaskVideo(nn.Module):
 			x, attn_logits, _, _ = block(x, None, temporal_mask)
 		x = self.transformer_norm(x[:, 1:])
 
-		# ignore CLS token for decoding
-		dec_code = self.code_head(x)
-		dec_rgb = self.rgb_head(x.flatten(0, 1))
-		dec_rgb = dec_rgb.reshape(B, T, *dec_rgb.shape[-3:])
-		dec_feat = self.feat_head(x)
-
-		dec = {
-			"rgb": dec_rgb,
-			"code": dec_code,
-			"feat": dec_feat,
-		}
-
-		return codes, raw_features, x, attn_logits, dec
+		return codes, raw_features, x, attn_logits, self._decode(x)
 	

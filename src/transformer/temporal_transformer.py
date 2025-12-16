@@ -45,22 +45,25 @@ class TemporalBlock(nn.Module):
 		query: torch.FloatTensor,			# (B, T', HW, D)
 		spatial_mask: torch.BoolTensor,		# (1, T', T')
 		temporal_mask: torch.BoolTensor,	# (1, T', T')
-		past_key: torch.FloatTensor=None, past_value: torch.FloatTensor=None,
+		# past_spatial_info: torch.FloatTensor=None, # (B, T, HW, D)
+		past_key: torch.FloatTensor=None,  # (B, T, HW, D)
+		past_value: torch.FloatTensor=None,
 	) -> torch.FloatTensor:
-		B, T_, HW, D = query.shape
 		
 		x_norm = self.spatial_attn_norm(query)
-		x, spatial_attn_logits, _, _ = self.spatial_attn(x_norm, None, None, None)
-		x = self.drop_path(x) + query
-
+		x, spatial_attn_logits, k, v = self.spatial_attn(x_norm, None, None, None)
+		x = self.drop_path(x) + query  # (B, T_, HW, D)
+		
 		x_norm = self.temporal_attn_norm(x)
 		x, temporal_attn_logits, k, v = self.temporal_attn(
-			x_norm, temporal_mask, past_key, past_value
+			x_norm, None, temporal_mask, past_key, past_value
 		)
 		x = self.drop_path(x) + x
 
 		# non-linear
 		x_norm = self.mlp_norm(x)
 		x = self.drop_path(self.mlp(x_norm)) + x
+		# print(k.shape, v.shape)
 
+		# return x, spatial_attn_logits, k, v
 		return x, temporal_attn_logits, k, v
